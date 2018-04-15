@@ -99,10 +99,7 @@ class DNSServer:
         for answer in answers:
             self.cache[(answer.type, answer.domain)] = answer
 
-    def exit(self):
-        self.server.close()
-
-
+            
 class DNSEntry:
     def __init__(self, domain, type_, class_, ttl, data):
         self.domain = domain

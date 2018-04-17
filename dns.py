@@ -4,7 +4,6 @@ import binascii
 import io
 import threading
 import datetime
-import time
 import pickle
 
 from cache import CacheDict
@@ -52,6 +51,7 @@ class DNSServer:
         threading.Thread(target=server._accept_conns, args=()).start()
 
     def _accept_conns(self):
+        print('Waiting for connections')
         while True:
             try:
                 conn, addr = self.server.accept()
@@ -61,6 +61,7 @@ class DNSServer:
                 break
 
     def _listen(self, conn, addr):
+        print('Client connected on {}'.format(addr))
         try:
             while True:
                 data = ''
@@ -99,7 +100,7 @@ class DNSServer:
         for answer in answers:
             self.cache[(answer.type, answer.domain)] = answer
 
-            
+
 class DNSEntry:
     def __init__(self, domain, type_, class_, ttl, data):
         self.domain = domain
@@ -178,7 +179,7 @@ class DNSData:
                                                         io_rdata.read(4),
                                                         io_rdata.read(4),
                                                         io_rdata.read(4)]]
-            data = 'Primary name server: {}\r\nResponsible authority\'s mailbox:{}\r\nSerial Number: {}\r\n' \
+            data = 'Primary name server: {}\r\nResponsible authority\'s mailbox: {}\r\nSerial Number: {}\r\n' \
                    'Refresh interval: {}\r\nRetry interval: {}\r\nExpire limit: {}\r\n' \
                    'Minimum TTL: {}'.format(mname, rname, serial, refresh, retry, expire, minimum)
 
@@ -310,32 +311,32 @@ def main():
     port = 53
     DNSServer.raise_server(host, port, 4)
 
-    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client.connect((host, port))
-
-    while True:
-        client.send('A dsadsadsad23423dsas.ru'.encode())
-        d = client.recv(4096).decode(errors='ignore')
-        print('!', d)
-        time.sleep(2)
-
-        client.send('SOA ru'.encode())
-        d = client.recv(4096).decode(errors='ignore')
-        print('!', d)
-        time.sleep(2)
-
-        client.send('A iana.org'.encode())
-        d = client.recv(4096).decode(errors='ignore')
-        print('!', d)
-        time.sleep(2)
-
-        client.send('MX mail.ru'.encode())
-        d = client.recv(4096).decode(errors='ignore')
-        print('!', d)
-        time.sleep(2)
-        break
-
-    client.close()
+    # client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # client.connect((host, port))
+    #
+    # while True:
+    #     client.send('A dsadsadsad23423dsas.ru'.encode())
+    #     d = client.recv(4096).decode(errors='ignore')
+    #     print('!', d)
+    #     time.sleep(2)
+    #
+    #     client.send('SOA ru'.encode())
+    #     d = client.recv(4096).decode(errors='ignore')
+    #     print('!', d)
+    #     time.sleep(2)
+    #
+    #     client.send('A iana.org'.encode())
+    #     d = client.recv(4096).decode(errors='ignore')
+    #     print('!', d)
+    #     time.sleep(2)
+    #
+    #     client.send('MX mail.ru'.encode())
+    #     d = client.recv(4096).decode(errors='ignore')
+    #     print('!', d)
+    #     time.sleep(2)
+    #     break
+    #
+    # client.close()
 
 if __name__ == '__main__':
     main()

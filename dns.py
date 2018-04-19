@@ -5,6 +5,8 @@ import io
 import threading
 import datetime
 import pickle
+import sys
+import signal
 
 from cache import CacheDict
 
@@ -20,81 +22,84 @@ def validate_cache_entry(entry):
 
 
 class DNSServer:
-    def __init__(self, host, port, validation_time):
+    def __init__(self, main_server, host, port, validation_time):
         dict_ = None
         try:
             dict_ = pickle.load(open(SAVE_FILE, "rb"))
         except (EOFError, IOError):
             pass
+        self.serialized = False
         self.host = host
+        self.main_server = main_server
         self.port = port
         self.cache = CacheDict(validate_cache_entry, validation_time, back_up_dict=dict_)
         self.cache_dispatcher = self.cache.dispatcher
-        self.clients = {}
+        self.server = None
 
-        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server.bind((host, port))
-        self.server.settimeout(2.5)  # TODO: del?
-        self.server.listen(10)
-
-    def __del__(self):
+    def __serialize(self):
+        print('Serializing cache...')
         self.cache_dispatcher.stop = True
         CacheDict.lock.acquire()
         with open(SAVE_FILE, 'wb') as f:
             CacheDict.lock.release()
             pickle.dump(self.cache.dict, f)
-        self.server.close()
+        print('Done!')
 
-    @staticmethod
-    def raise_server(host, port, validation_time):
-        server = DNSServer(host, port, validation_time)
-        threading.Thread(target=server._accept_conns, args=()).start()
+    def raise_server(self):
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.server.bind((self.host, self.port))
+        threading.Thread(target=self._accept_conns, args=()).start()
+
+    def shutdown(self):
+        try:
+            print("Shutting down server")
+            self.server.shutdown(socket.SHUT_RDWR)
+        except Exception as e:
+            pass
+        finally:
+            self.__serialize()
+            self.server.close()
 
     def _accept_conns(self):
-        print('Waiting for connections')
+        print('Waiting for connections on {} {}'.format(self.host, self.port))
         while True:
             try:
-                conn, addr = self.server.accept()
-                threading.Thread(target=self._listen, args=(conn, addr)).start()
-            except socket.timeout:
-                self.__del__()
+                data, addr = self.server.recvfrom(1024)
+                print(addr)
+                threading.Thread(target=self._handle_query, args=(data, addr)).start()
+            except Exception as e:
                 break
 
-    def _listen(self, conn, addr):
-        print('Client connected on {}'.format(addr))
+    def _handle_query(self, query, client):
+        print('Client connected on {}'.format(client))
+        answer = self._try_get_cache(query)
+        print('------------------------------------')
+        print('Cache: ', self.cache.dict)
+        print('------------------------------------')
+        if answer:  # TODO: del it
+            try:
+                response = DNSData()._create_response(query, answer)
+                self.server.sendto(response, client)
+            except ValueError:
+                pass
+            else:
+                print('Cache hit!')
+                return
+        print('Cache miss :(')
         try:
-            while True:
-                data = ''
-                # while (not data) and conn: TODO: del?
-                data = conn.recv(1024)
-                decoded_data = data.decode('utf-8')
-                type_, domain = decoded_data.split()
-                answer = self.cache[(type_, domain)]
-                print('------------------------------------')
-                print('Cache: ', self.cache.dict)
-                print('------------------------------------')
-
-                if answer:  # TODO: del it
-                    print('Cache hit!')
-
-                if not answer:
-                    print('Cache miss :(')
-                    dns_data = DNSData()
-                    answers = dns_data.process_name(type_, domain)
-                    self.update_cache(answers)
-                    if dns_data.error:
-                        conn.sendall(dns_data.error.encode('utf-8'))
-                        continue
-                    answer = self.cache[(type_, domain)]
-                try:
-                    conn.sendall(str(answer).encode('utf-8'))
-                except TypeError:
-                    print('Something went wrong')
-                    conn.close()
-                    return
-        except Exception as e:
-            conn.close()
+            dns_data = DNSData()
+            answers = dns_data.process_name(query, self.main_server)
+            self.update_cache(answers)
+            self.server.sendto(dns_data.response_data, client)
+        except:
             return
+
+    def _try_get_cache(self, query):
+        io_question = io.BytesIO(query[12:])
+        temp = DNSData()
+        domain = temp._form_domain_name(temp._get_domain_name(io.BytesIO(), io_question, 0))
+        type_ = temp.types[int.from_bytes(io_question.read(2), byteorder='big')]
+        return self.cache[(type_, domain)]
 
     def update_cache(self, answers):
         for answer in answers:
@@ -133,7 +138,9 @@ class DNSData:
         self.authority_count = None
         self.additional_count = None
         self.raw_answers = None
+        self.pointers = dict()
         self.error = None
+        self.standard_response = b'\x81\x80'
         self.types = {1: 'A', 2: 'NS', 3: 'MD', 15: 'MX', 4: 'MF', 16: 'TXT', 6: 'SOA'}
         self.byte_qtypes = {'A': self.__one, 'NS': bytes.fromhex('0002'),
                             'MD': bytes.fromhex('0003'), 'SOA': bytes.fromhex('0006'),
@@ -141,9 +148,9 @@ class DNSData:
                             'TXT': bytes.fromhex('0010')}
         self.answers = []
 
-    def process_name(self, qtype, domain):
-        self._generate_query(qtype, domain)
-        self.send_query()
+    def process_name(self, query, ip):
+        self.query = query
+        self.send_query(ip)
         if self.io_response_data:
             self._parse_response()
         return self.answers
@@ -159,31 +166,110 @@ class DNSData:
         ttl = int.from_bytes(ttl, byteorder='big')
         data = ''
         if qtype == 'A':
-            data = '.'.join(map(str, [int.from_bytes(bytes([x]), byteorder='big') for x in rdata]))
+            data = rdata
         elif qtype in {'NS', 'MD', 'MF'}:
-            data = self.__form_domain_name(self.__get_domain_name(io.BytesIO(), io.BytesIO(rdata), 0))
+            data = self._form_domain_name(self._get_domain_name(io.BytesIO(), io.BytesIO(rdata), 0))
         elif qtype == 'MX':
             io_rdata = io.BytesIO(rdata)
             preference = int.from_bytes(io_rdata.read(2), byteorder='big')
-            name = self.__form_domain_name(self.__get_domain_name(io.BytesIO(), io_rdata, 0))
-            data = ('Preference: {}'.format(preference), name)
+            name = self._form_domain_name(self._get_domain_name(io.BytesIO(), io_rdata, 0))
+            data = preference, name
         elif qtype == 'TXT':
             data = rdata.decode('utf-8', errors='ignore')
         elif qtype == 'SOA':
             io_rdata = io.BytesIO(rdata)
-            mname = self.__form_domain_name(self.__get_domain_name(io.BytesIO(), io_rdata, 0))
-            rname = self.__form_domain_name(self.__get_domain_name(io.BytesIO(), io_rdata, 0))
+            mname = self._form_domain_name(self._get_domain_name(io.BytesIO(), io_rdata, 0))
+            rname = self._form_domain_name(self._get_domain_name(io.BytesIO(), io_rdata, 0))
             serial, refresh, retry, expire, minimum = [int.from_bytes(x, byteorder='big') for x in
                                                        [io_rdata.read(4),
                                                         io_rdata.read(4),
                                                         io_rdata.read(4),
                                                         io_rdata.read(4),
                                                         io_rdata.read(4)]]
-            data = 'Primary name server: {}\r\nResponsible authority\'s mailbox: {}\r\nSerial Number: {}\r\n' \
-                   'Refresh interval: {}\r\nRetry interval: {}\r\nExpire limit: {}\r\n' \
-                   'Minimum TTL: {}'.format(mname, rname, serial, refresh, retry, expire, minimum)
+            data = mname, rname, serial, refresh, retry, expire, minimum
 
         return DNSEntry(domain, qtype, class_, ttl, data)
+
+    def _create_response(self, source_query, entry):
+        answer = bytes()
+        answer = source_query[:2] + self.standard_response + source_query[4:6]
+        count = len(entry.data) if isinstance(entry.data, list) else 1
+        answer += count.to_bytes(2, byteorder='big')
+        answer += source_query[8:]
+        self.__create_pointers(source_query[12:], source_query)
+        answer += self.__create_answer(entry, count != 1)
+        return answer
+
+    def __create_answer(self, entry, is_list=False):
+        if not is_list:
+            entry.data = [entry.data]
+        result = bytes()
+        for entry_data in entry.data:
+            result += self.__encode_name(entry.domain)
+            result += self.byte_qtypes[entry.type]
+            result += self.__one
+            today = datetime.datetime.today()
+            seconds_elapsed = (today - entry.got_at).seconds
+            new_ttl = (entry.ttl - seconds_elapsed)
+            if new_ttl <= 0:
+                raise ValueError()
+            result += new_ttl.to_bytes(4, byteorder='big')
+            data = bytes()
+            if entry.type == 'A':
+                data = entry_data
+            elif entry.type in {'NS', 'MD', 'MF'}:
+                data = self.__encode_name(entry_data)
+            elif entry.type == 'MX':
+                data = entry_data[0].to_bytes(2, byteorder='big') + self.__encode_name(entry_data[1])
+            elif entry.type == 'TXT':
+                data = entry_data.encode('utf-8')
+            elif entry.type == 'SOA':
+                data += self.__encode_name(data[0])
+                data += self.__encode_name(data[1])
+                data += b''.join([x.to_bytes(4, byteorder='big') for x in entry_data[2:]])
+            result += len(data).to_bytes(2, byteorder='big') + data
+        return result
+
+    def __encode_name(self, raw_name):
+        name = b''.join([bytes([len(x)]) + x.encode('utf-8') for x in raw_name.split('.')])
+        result = bytes()
+        i = 0
+        while name != b'\x00':
+            if name in self.pointers:
+                pointer = (int('0b1100000000000000', 2) + self.pointers[name]).to_bytes(2, byteorder='big')
+                result += pointer
+                break
+            else:
+                length = int.from_bytes(name[i], byteorder='big')
+                result += name[i:i + length + 1]
+                i += length + 1
+        return result
+
+    def __create_pointers(self, data, source_query):
+        result = io.BytesIO()
+        io_data = io.BytesIO(data)
+        first_length = 0
+        while True:
+            new_offset = self.__get_offset(io_data)
+            if new_offset:
+                return
+            d = io_data.read(1)
+            if d == b'\x00':
+                break
+            length = int.from_bytes(d, byteorder='big')
+            if not first_length:
+                first_length = length
+            result.write(d)
+            result.write(io_data.read(length))
+        result.seek(0)
+        domain_name = result.read()
+
+        pointer = source_query.find(domain_name)
+        self.pointers[domain_name] = pointer
+
+        if first_length:
+            self.__create_pointers(data[first_length + 1:], source_query)
+
 
     def _generate_query(self, qtype_word, domain_name):
         id_ = binascii.unhexlify(add_padding(hex(next(ID)), '0x', 4)[2:])
@@ -200,14 +286,13 @@ class DNSData:
         self.query = id_ + conf_bits + qdcount + ancount + nscount + arcount + question
         self.questions.append(question)
 
-    def send_query(self):
-        udp_ip = "8.8.8.8"
-        udp_port = 53
+    def send_query(self, ip):
+        port = 53
         conn = None
         data = bytes()
         try:
             conn = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            conn.connect((udp_ip, udp_port))
+            conn.connect((ip, port))
             conn.send(self.query)
             data = conn.recv(4096)
         except socket.error:
@@ -218,16 +303,26 @@ class DNSData:
         self.io_response_data = io.BytesIO(data)
         self.questions_count = 1
 
+    def __parse_questions(self, query, questions_count):
+        io_query = io.BytesIO(query)
+        for i in range(0, questions_count):
+            name = self._get_domain_name(io.BytesIO(), io_query, 0)
+            name.seek(0)
+            end = self.__end
+            type_ = io_query.read(2)
+            class_ = io_query.read(2)
+            self.questions.append(name.read() + end + type_ + class_)
+
     def _parse_response(self):
         self.header = self.response_data[:12]
-        reply_code = bin(int.from_bytes(bytes([self.header[3]]), byteorder='big'))[6:]
-        if reply_code == '0011':
-            self.error = 'No such name (3)'
         self.answers_count, self.authority_count, self.additional_count = [int.from_bytes(x, byteorder='big')
                                                                            for x in [self.header[6:8],
                                                                                      self.header[8:10],
                                                                                      self.header[10:]]]
-
+        try:
+            self.__parse_questions(self.query[12:], self.questions_count)
+        except Exception as e:
+            pass
         ans_offset = len(self.header) + self.__get_section_length(self.questions)
         self.raw_answers = self.response_data[ans_offset:]
         prev = None
@@ -251,7 +346,7 @@ class DNSData:
     def __parse_answers(self):
         data = io.BytesIO(self.raw_answers)
         while data.tell() != len(self.raw_answers):
-            name = self.__form_domain_name(self.__get_domain_name(io.BytesIO(), data, 0))
+            name = self._form_domain_name(self._get_domain_name(io.BytesIO(), data, 0))
             type_ = data.read(2)
             class_ = data.read(2)
             ttl = data.read(4)
@@ -262,14 +357,14 @@ class DNSData:
     def __get_section_length(self, param):
         return sum(map(len, param))
 
-    def __get_domain_name(self, result, data, offset):
+    def _get_domain_name(self, result, data, offset):
         if offset:
             data.seek(offset)
 
         while True:
             new_offset = self.__get_offset(data)
             if new_offset:
-                self.__get_domain_name(result, self.io_response_data, new_offset)
+                self._get_domain_name(result, self.io_response_data, new_offset)
                 break
             else:
                 d = data.read(1)
@@ -290,7 +385,7 @@ class DNSData:
         data.seek(current_position)
         return None
 
-    def __form_domain_name(self, data_io):
+    def _form_domain_name(self, data_io):
         data_io.seek(0)
         raw_data = data_io.read()
         data_io.seek(0)
@@ -307,36 +402,29 @@ def add_padding(s, prefix, padding):
 
 
 def main():
+    def shutdown_server(sig, unused):
+        """
+        Shutsdown server from a SIGINT recieved signal
+        """
+        server.shutdown()
+        sys.exit(1)
+
     host = 'localhost'
     port = 53
-    DNSServer.raise_server(host, port, 4)
+    main_server = None
+    try:
+        main_server = sys.argv[1]
+    except IndexError:
+        print('Select main DNS server')
 
-    # client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # client.connect((host, port))
-    #
-    # while True:
-    #     client.send('A dsadsadsad23423dsas.ru'.encode())
-    #     d = client.recv(4096).decode(errors='ignore')
-    #     print('!', d)
-    #     time.sleep(2)
-    #
-    #     client.send('SOA ru'.encode())
-    #     d = client.recv(4096).decode(errors='ignore')
-    #     print('!', d)
-    #     time.sleep(2)
-    #
-    #     client.send('A iana.org'.encode())
-    #     d = client.recv(4096).decode(errors='ignore')
-    #     print('!', d)
-    #     time.sleep(2)
-    #
-    #     client.send('MX mail.ru'.encode())
-    #     d = client.recv(4096).decode(errors='ignore')
-    #     print('!', d)
-    #     time.sleep(2)
-    #     break
-    #
-    # client.close()
+    if main_server:
+        signal.signal(signal.SIGINT, shutdown_server)
+        server = DNSServer(main_server, host, port, 4)
+        server.raise_server()
+        print("Press Ctrl+C to shut down server.")
+        while True:
+            pass
+
 
 if __name__ == '__main__':
     main()

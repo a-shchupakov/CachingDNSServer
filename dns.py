@@ -415,7 +415,15 @@ def main():
         main_server = sys.argv[1]
     except IndexError:
         main_server = '8.8.8.8'
+    finally:
         print('Main DNS server is now ' + main_server)
+
+    try:
+        port = int(sys.argv[2])
+    except IndexError:
+        port = 53
+    finally:
+        print('Port is now set to ', port)
 
     if main_server:
         signal.signal(signal.SIGINT, shutdown_server)

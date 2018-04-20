@@ -67,17 +67,17 @@ class DNSServer:
         while True:
             try:
                 data, addr = self.server.recvfrom(1024)
-                print(addr)
                 threading.Thread(target=self._handle_query, args=(data, addr)).start()
             except Exception as e:
                 break
 
     def _handle_query(self, query, client):
+        print()
         print('Client connected on {}'.format(client))
-        print(query)
+        print('Client\'s query: ', query)
         answer = self._try_get_cache(query)
         print('------------------------------------')
-        print('Cache: ', self.cache)
+        print('Cache before query: ', self.cache)
         print('------------------------------------')
         if answer:
             try:
@@ -409,6 +409,7 @@ def main():
 
     host = 'localhost'
     port = 53
+    cache_validation_time = 3
     main_server = None
     try:
         main_server = sys.argv[1]
@@ -418,7 +419,7 @@ def main():
 
     if main_server:
         signal.signal(signal.SIGINT, shutdown_server)
-        server = DNSServer(main_server, host, port, 4)
+        server = DNSServer(main_server, host, port, cache_validation_time)
         server.raise_server()
         print("Press Ctrl+C to shut down server.")
         while True:

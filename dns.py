@@ -1,6 +1,5 @@
 import socket
 import itertools
-import binascii
 import io
 import threading
 import datetime
@@ -8,7 +7,7 @@ import pickle
 import sys
 import signal
 
-from cache import CacheDict
+from cache import CacheArray
 
 ID = itertools.count()
 SAVE_FILE = 'save.p'
@@ -23,32 +22,34 @@ def validate_cache_entry(entry):
 
 class DNSServer:
     def __init__(self, main_server, host, port, validation_time):
-        dict_ = None
+        array = None
         try:
-            dict_ = pickle.load(open(SAVE_FILE, "rb"))
+            array = pickle.load(open(SAVE_FILE, "rb"))
         except (EOFError, IOError):
             pass
         self.serialized = False
         self.host = host
         self.main_server = main_server
         self.port = port
-        self.cache = CacheDict(validate_cache_entry, validation_time, back_up_dict=dict_)
+        self.cache = CacheArray(validate_cache_entry, validation_time, back_up_array=array)
         self.cache_dispatcher = self.cache.dispatcher
         self.server = None
+        self.is_alive = False
 
     def __serialize(self):
         print('Serializing cache...')
         self.cache_dispatcher.stop = True
-        CacheDict.lock.acquire()
+        CacheArray.lock.acquire()
         with open(SAVE_FILE, 'wb') as f:
-            CacheDict.lock.release()
-            pickle.dump(self.cache.dict, f)
+            CacheArray.lock.release()
+            pickle.dump(self.cache.array, f)
         print('Done!')
 
     def raise_server(self):
         self.server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.server.bind((self.host, self.port))
         threading.Thread(target=self._accept_conns, args=()).start()
+        self.is_alive = True
 
     def shutdown(self):
         try:
@@ -59,6 +60,7 @@ class DNSServer:
         finally:
             self.__serialize()
             self.server.close()
+            self.is_alive = False
 
     def _accept_conns(self):
         print('Waiting for connections on {} {}'.format(self.host, self.port))
@@ -72,11 +74,12 @@ class DNSServer:
 
     def _handle_query(self, query, client):
         print('Client connected on {}'.format(client))
+        print(query)
         answer = self._try_get_cache(query)
         print('------------------------------------')
-        print('Cache: ', self.cache.dict)
+        print('Cache: ', self.cache)
         print('------------------------------------')
-        if answer:  # TODO: del it
+        if answer:
             try:
                 response = DNSData()._create_response(query, answer)
                 self.server.sendto(response, client)
@@ -91,15 +94,25 @@ class DNSServer:
             answers = dns_data.process_name(query, self.main_server)
             self.update_cache(answers)
             self.server.sendto(dns_data.response_data, client)
-        except:
+        except Exception as e:
             return
 
     def _try_get_cache(self, query):
         io_question = io.BytesIO(query[12:])
+        questions_count = int.from_bytes(query[4:6], byteorder='big')
         temp = DNSData()
-        domain = temp._form_domain_name(temp._get_domain_name(io.BytesIO(), io_question, 0))
-        type_ = temp.types[int.from_bytes(io_question.read(2), byteorder='big')]
-        return self.cache[(type_, domain)]
+        questions = []
+        for i in range(0, questions_count):
+            domain = temp._form_domain_name(temp._get_domain_name(io.BytesIO(), io_question, 0))
+            type_ = io_question.read(2)
+            _ = io_question.read(2)
+            entries = self.cache[(type_, domain)]
+            if entries:
+                for entry in entries:
+                    questions.append(entry)
+            else:
+                return None
+        return questions
 
     def update_cache(self, answers):
         for answer in answers:
@@ -156,135 +169,132 @@ class DNSData:
         return self.answers
 
     def __create_entry(self, domain, type_, class_, ttl, rdata):
-        class_ = 'IN'
-
-        type_value = int.from_bytes(type_, byteorder='big')
-        try:
-            qtype = self.types[type_value]
-        except KeyError:
-            qtype = 'unknown'
         ttl = int.from_bytes(ttl, byteorder='big')
-        data = ''
-        if qtype == 'A':
+        data = None
+        if type_ == b'\x00\x01':
             data = rdata
-        elif qtype in {'NS', 'MD', 'MF'}:
+        elif type_ in {b'\x00\x02', b'\x00\x03', b'\x00\x04'}:
             data = self._form_domain_name(self._get_domain_name(io.BytesIO(), io.BytesIO(rdata), 0))
-        elif qtype == 'MX':
+        elif type_ == b'\x00\x0f':
             io_rdata = io.BytesIO(rdata)
-            preference = int.from_bytes(io_rdata.read(2), byteorder='big')
+            preference = io_rdata.read(2)
             name = self._form_domain_name(self._get_domain_name(io.BytesIO(), io_rdata, 0))
             data = preference, name
-        elif qtype == 'TXT':
-            data = rdata.decode('utf-8', errors='ignore')
-        elif qtype == 'SOA':
+        elif type_ == b'\x00\x10':
+            data = rdata
+        elif type_ == b'\x00\x06':
             io_rdata = io.BytesIO(rdata)
             mname = self._form_domain_name(self._get_domain_name(io.BytesIO(), io_rdata, 0))
             rname = self._form_domain_name(self._get_domain_name(io.BytesIO(), io_rdata, 0))
-            serial, refresh, retry, expire, minimum = [int.from_bytes(x, byteorder='big') for x in
-                                                       [io_rdata.read(4),
-                                                        io_rdata.read(4),
-                                                        io_rdata.read(4),
-                                                        io_rdata.read(4),
-                                                        io_rdata.read(4)]]
-            data = mname, rname, serial, refresh, retry, expire, minimum
+            remains = io_rdata.read(20)
+            data = mname, rname, remains
+        else:
+            return
+        return DNSEntry(domain, type_, class_, ttl, data)
 
-        return DNSEntry(domain, qtype, class_, ttl, data)
+    def _create_response(self, source_query, answers):
+        id_ = source_query[:2]
+        questions_count = source_query[4:6]
+        answers_count = len(answers).to_bytes(2, byteorder='big')
+        auth_count, additional_count = b'\x00\x00', b'\x00\x00'
+        temp_source_io = io.BytesIO(source_query[12:])
+        questions = self._form_domain_name(self._get_domain_name(io.BytesIO(), temp_source_io, 0))
+        questions += temp_source_io.read(4)
+        remains_of_source_query = temp_source_io.read()  # Тут бывает посылаются Additional пакеты (в запросе). Их просто отбрасываем
 
-    def _create_response(self, source_query, entry):
-        answer = bytes()
-        answer = source_query[:2] + self.standard_response + source_query[4:6]
-        count = len(entry.data) if isinstance(entry.data, list) else 1
-        answer += count.to_bytes(2, byteorder='big')
-        answer += source_query[8:]
-        self.__create_pointers(source_query[12:], source_query)
-        answer += self.__create_answer(entry, count != 1)
-        return answer
+        dns_response = (id_ + self.standard_response +
+                        questions_count + answers_count + auth_count + additional_count +
+                        questions)
+        self.__create_pointers_from_question(questions, questions_count, source_query)
 
-    def __create_answer(self, entry, is_list=False):
-        if not is_list:
-            entry.data = [entry.data]
-        result = bytes()
-        for entry_data in entry.data:
-            result += self.__encode_name(entry.domain)
-            result += self.byte_qtypes[entry.type]
-            result += self.__one
-            today = datetime.datetime.today()
-            seconds_elapsed = (today - entry.got_at).seconds
-            new_ttl = (entry.ttl - seconds_elapsed)
-            if new_ttl <= 0:
-                raise ValueError()
-            result += new_ttl.to_bytes(4, byteorder='big')
-            data = bytes()
-            if entry.type == 'A':
-                data = entry_data
-            elif entry.type in {'NS', 'MD', 'MF'}:
-                data = self.__encode_name(entry_data)
-            elif entry.type == 'MX':
-                data = entry_data[0].to_bytes(2, byteorder='big') + self.__encode_name(entry_data[1])
-            elif entry.type == 'TXT':
-                data = entry_data.encode('utf-8')
-            elif entry.type == 'SOA':
-                data += self.__encode_name(data[0])
-                data += self.__encode_name(data[1])
-                data += b''.join([x.to_bytes(4, byteorder='big') for x in entry_data[2:]])
-            result += len(data).to_bytes(2, byteorder='big') + data
-        return result
+        actual_answers = 0
+        for answer in answers:
+            answer_bytes = self.__create_answer(answer, dns_response)
+            if answer_bytes:
+                actual_answers += 1
+                dns_response += answer_bytes
 
-    def __encode_name(self, raw_name):
-        name = b''.join([bytes([len(x)]) + x.encode('utf-8') for x in raw_name.split('.')])
+        # Correct answer count value
+        if actual_answers != len(answers):
+            corrected_dns_response = dns_response[:6] + actual_answers.to_bytes(2, byteorder='big') + dns_response[8:]
+            dns_response = corrected_dns_response
+
+        return dns_response
+
+    def __create_pointers_from_question(self, questions, questions_count, source_query):
+        names = set()
+        questions_io = io.BytesIO(questions)
+        for i in range(0, int.from_bytes(questions_count, byteorder='big')):
+            names.add(self._form_domain_name(self._get_domain_name(io.BytesIO(), questions_io, 0)))
+
+        for name in names:
+            self.__create_pointers_from_name(name, source_query)
+
+    def __create_answer(self, entry, full_query):
+        temp_full_query = full_query
+
+        name = self.__encode_name(entry.domain, temp_full_query)
+        type_ = entry.type
+        class_ = entry.class_
+        today = datetime.datetime.today()
+        seconds_elapsed = (today - entry.got_at).seconds
+        new_ttl = (entry.ttl - seconds_elapsed)
+        if new_ttl <= 0:
+            return b''
+        ttl = new_ttl.to_bytes(4, byteorder='big')
+
+        temp_full_query += name + type_ + class_ + ttl
+        data = bytes()
+        if entry.type == b'\x00\x01':
+            data = entry.data
+        elif entry.type in {b'\x00\x02', b'\x00\x03', b'\x00\x04'}:
+            data = self.__encode_name(entry.data, temp_full_query)
+        elif entry.type == b'\x00\x0f':
+            data = entry.data[0] + self.__encode_name(entry.data[1], temp_full_query)
+        elif entry.type == b'\x00\x10':
+            data = entry.data
+        elif entry.type == b'\x00\x06':
+            data += self.__encode_name(entry.data[0], temp_full_query)
+            data += self.__encode_name(entry.data[1], temp_full_query)
+            data += entry.data[2]
+        else:
+            return b''
+        length = len(data).to_bytes(2, byteorder='big')
+
+        return name + type_ + class_ + ttl + length + data
+
+    def __encode_name(self, raw_name, full_query):
+        name = raw_name
         result = bytes()
         i = 0
-        while name != b'\x00':
+        while True:
             if name in self.pointers:
                 pointer = (int('0b1100000000000000', 2) + self.pointers[name]).to_bytes(2, byteorder='big')
                 result += pointer
                 break
             else:
-                length = int.from_bytes(name[i], byteorder='big')
+                length = name[i]
+                if length == b'\x00':
+                    result += length
+                    self.__create_pointers_from_name(raw_name, full_query)
+                    break
+                else:
+                    if not isinstance(length, int):
+                        length = int.from_bytes(length, byteorder='big')
                 result += name[i:i + length + 1]
+                name = name[i + length + 1:]
                 i += length + 1
         return result
 
-    def __create_pointers(self, data, source_query):
-        result = io.BytesIO()
-        io_data = io.BytesIO(data)
-        first_length = 0
-        while True:
-            new_offset = self.__get_offset(io_data)
-            if new_offset:
-                return
-            d = io_data.read(1)
-            if d == b'\x00':
-                break
-            length = int.from_bytes(d, byteorder='big')
-            if not first_length:
-                first_length = length
-            result.write(d)
-            result.write(io_data.read(length))
-        result.seek(0)
-        domain_name = result.read()
-
-        pointer = source_query.find(domain_name)
-        self.pointers[domain_name] = pointer
-
-        if first_length:
-            self.__create_pointers(data[first_length + 1:], source_query)
-
-
-    def _generate_query(self, qtype_word, domain_name):
-        id_ = binascii.unhexlify(add_padding(hex(next(ID)), '0x', 4)[2:])
-        conf_bits = self.__conf_bits
-        qdcount, ancount, nscount, arcount = [self.__one] + [self.__zero] * 3
-        qname = bytes()
-        for label in domain_name.split('.'):
-            qname += bytes([len(label)])
-            qname += label.encode()
-        end = self.__end
-        qtype = self.byte_qtypes[qtype_word]
-        qclass = self.__one
-        question = qname + end + qtype + qclass
-        self.query = id_ + conf_bits + qdcount + ancount + nscount + arcount + question
-        self.questions.append(question)
+    def __create_pointers_from_name(self, name, source_query):
+        if name == b'\x00':
+            return
+        pointer = source_query.find(name)
+        if pointer != - 1 and name not in self.pointers:
+            self.pointers[name] = pointer
+        first_length = name[0]
+        if first_length != b'\x00':
+            self.__create_pointers_from_name(name[first_length + 1:], source_query)
 
     def send_query(self, ip):
         port = 53
@@ -301,17 +311,16 @@ class DNSData:
             conn.close()
         self.response_data = data
         self.io_response_data = io.BytesIO(data)
-        self.questions_count = 1
+        self.questions_count = int.from_bytes(data[4:6], byteorder='big')
 
     def __parse_questions(self, query, questions_count):
         io_query = io.BytesIO(query)
         for i in range(0, questions_count):
             name = self._get_domain_name(io.BytesIO(), io_query, 0)
             name.seek(0)
-            end = self.__end
             type_ = io_query.read(2)
             class_ = io_query.read(2)
-            self.questions.append(name.read() + end + type_ + class_)
+            self.questions.append(name.read() + type_ + class_)
 
     def _parse_response(self):
         self.header = self.response_data[:12]
@@ -325,23 +334,10 @@ class DNSData:
             pass
         ans_offset = len(self.header) + self.__get_section_length(self.questions)
         self.raw_answers = self.response_data[ans_offset:]
-        prev = None
         for answer in self.__parse_answers():
-            # Merge same answers (different ips)
-            if prev and answer[0] == prev[0] and answer[1] == prev[1]:
-                cur_entry = self.__create_entry(*answer)
-                prev_entry = self.answers.pop()
-                new_rdata = None
-                if isinstance(prev_entry.data, list):
-                    prev_entry.data.append(cur_entry.data)
-                    new_rdata = prev_entry.data
-                else:
-                    new_rdata = [prev_entry.data, cur_entry.data]
-                self.answers.append(DNSEntry(cur_entry.domain, cur_entry.type, cur_entry.class_, cur_entry.ttl,
-                                             new_rdata))
-            else:
-                self.answers.append(self.__create_entry(*answer))
-            prev = answer
+            entry = self.__create_entry(*answer)
+            if entry:
+                self.answers.append(entry)
 
     def __parse_answers(self):
         data = io.BytesIO(self.raw_answers)
@@ -369,6 +365,7 @@ class DNSData:
             else:
                 d = data.read(1)
                 if d == b'\x00':
+                    result.write(d)
                     break
                 length = int.from_bytes(d, byteorder='big')
                 result.write(d)
@@ -388,13 +385,14 @@ class DNSData:
     def _form_domain_name(self, data_io):
         data_io.seek(0)
         raw_data = data_io.read()
-        data_io.seek(0)
-        labels = []
-        while data_io.tell() != len(raw_data):
-            len_ = int.from_bytes(data_io.read(1), byteorder='big')
-            labels.append(data_io.read(len_).decode('utf-8'))
-
-        return '.'.join(labels)
+        return raw_data  # Нет смысла переводить байты в доменное имя
+        # data_io.seek(0)
+        # labels = []
+        # while data_io.tell() != len(raw_data):
+        #     len_ = int.from_bytes(data_io.read(1), byteorder='big')
+        #     labels.append(data_io.read(len_).decode('utf-8'))
+        #
+        # return '.'.join(labels)
 
 
 def add_padding(s, prefix, padding):
@@ -404,7 +402,7 @@ def add_padding(s, prefix, padding):
 def main():
     def shutdown_server(sig, unused):
         """
-        Shutsdown server from a SIGINT recieved signal
+        Shutsdown server from a SIGINT received signal
         """
         server.shutdown()
         sys.exit(1)
@@ -415,7 +413,8 @@ def main():
     try:
         main_server = sys.argv[1]
     except IndexError:
-        print('Select main DNS server')
+        main_server = '8.8.8.8'
+        print('Main DNS server is now ' + main_server)
 
     if main_server:
         signal.signal(signal.SIGINT, shutdown_server)

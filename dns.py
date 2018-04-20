@@ -198,8 +198,12 @@ class DNSData:
         answers_count = len(answers).to_bytes(2, byteorder='big')
         auth_count, additional_count = b'\x00\x00', b'\x00\x00'
         temp_source_io = io.BytesIO(source_query[12:])
-        questions = self._form_domain_name(self._get_domain_name(io.BytesIO(), temp_source_io, 0))
-        questions += temp_source_io.read(4)
+
+        questions = bytes()
+        for _ in range(0, int.from_bytes(questions_count, byteorder='big')):
+            question_name = self._form_domain_name(self._get_domain_name(io.BytesIO(), temp_source_io, 0))
+            questions += question_name + temp_source_io.read(4)
+
         remains_of_source_query = temp_source_io.read()  # Тут бывает посылаются Additional пакеты (в запросе). Их просто отбрасываем
 
         dns_response = (id_ + self.standard_response +

@@ -18,15 +18,13 @@ def locking(func, lock):
     return wrapped
 
 
-class CacheDictDispatcher:
+class CacheDispatcher:
     def __init__(self, func, sleep_time):
         self.thread = threading.Thread(target=self.start_validation, args=(func, sleep_time))
         self.stop = False
 
     def start_validation(self, func, sleep_time):
-        while True:
-            if self.stop:
-                break
+        while not self.stop:
             func()
             time.sleep(sleep_time)
 
@@ -39,8 +37,14 @@ class CacheDict:
         if not callable(validation_func):
             raise TypeError('Callable object must be passed')
         self.is_valid = validation_func
-        self.dispatcher = CacheDictDispatcher(self.validate_cache, sleep_time)
+        self.dispatcher = CacheDispatcher(self.validate_cache, sleep_time)
         self.dispatcher.thread.start()
+
+    def __str__(self):
+        return str(self.dict)
+
+    def __repr__(self):
+        return str(self.dict)
 
     @locking(lock)
     def __contains__(self, item):
@@ -69,6 +73,46 @@ class CacheDict:
                 self.dict.pop(key)
 
 
+class CacheArray:
+    lock = threading.RLock()
+
+    def __init__(self, validation_func, sleep_time, back_up_array=None):
+        self.array = back_up_array if back_up_array else []
+        if not callable(validation_func):
+            raise TypeError('Callable object must be passed')
+        self.is_valid = validation_func
+        self.dispatcher = CacheDispatcher(self.validate_cache, sleep_time)
+        self.dispatcher.thread.start()
+
+    def __str__(self):
+        return ' ||| '.join(map(str, self.array))
+
+    def __repr__(self):
+        return ' ||| '.join(map(str, self.array))
+
+    @locking(lock)
+    def __getitem__(self, key):
+        success = False
+        for item in self.array:
+            if item[0] == key:
+                success = True
+                yield item[1]
+        if not success:
+            return None
+
+    @locking(lock)
+    def __setitem__(self, key, value):
+        self.array.append((key, value))
+
+    @locking(lock)
+    def validate_cache(self):
+        new_array = []
+        for item in self.array:
+            if self.is_valid(item[1]):
+                new_array.append(item)
+        self.array = new_array
+
+
 def validate(entry):
     import datetime
     time_ = datetime.datetime.today().second
@@ -79,7 +123,12 @@ def validate(entry):
 
 
 def main():
-    print(CacheDict(lambda x: True, 5))
+    cache = CacheArray(lambda x: False, 1)
+    cache[1] = 1
+    cache[2] = 2
+    print(cache)
+    time.sleep(2.5)
+    print(cache)
 
 
 if __name__ == '__main__':

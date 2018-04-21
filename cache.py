@@ -112,16 +112,7 @@ class CacheArray:
                 new_array.append(item)
         self.array = new_array
 
-
-def validate(entry):
-    import datetime
-    time_ = datetime.datetime.today().second
-    print(time_, entry[1])
-    if time_ > entry[1] + 2:
-        return False
-    return True
-
-
+        
 def main():
     cache = CacheArray(lambda x: False, 1)
     cache[1] = 1

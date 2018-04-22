@@ -270,24 +270,22 @@ class DNSData:
     def __encode_name(self, raw_name, full_query):
         name = raw_name
         result = bytes()
-        i = 0
         while True:
             if name in self.pointers:
                 pointer = (int('0b1100000000000000', 2) + self.pointers[name]).to_bytes(2, byteorder='big')
                 result += pointer
                 break
             else:
-                length = name[i]
-                if length == b'\x00':
-                    result += length
+                length = name[0]
+                if bytes([length]) == b'\x00':
+                    result += bytes([length])
                     self.__create_pointers_from_name(raw_name, full_query)
                     break
                 else:
                     if not isinstance(length, int):
                         length = int.from_bytes(length, byteorder='big')
-                result += name[i:i + length + 1]
-                name = name[i + length + 1:]
-                i += length + 1
+                result += name[:length + 1]
+                name = name[length + 1:]
         return result
 
     def __create_pointers_from_name(self, name, source_query):

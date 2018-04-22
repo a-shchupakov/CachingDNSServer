@@ -279,7 +279,7 @@ class DNSData:
                 length = name[0]
                 if bytes([length]) == b'\x00':
                     result += bytes([length])
-                    self.__create_pointers_from_name(raw_name, full_query)
+                    self.__create_pointers_from_name(raw_name, full_query + len(result).to_bytes(2, byteorder='big') + result)
                     break
                 else:
                     if not isinstance(length, int):
